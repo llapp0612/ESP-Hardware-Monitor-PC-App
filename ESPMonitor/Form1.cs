@@ -9,6 +9,9 @@ using OpenHardwareMonitor.Hardware;
 using System.IO.Ports;
 using System.Threading;
 using System.Text.Json;
+using System.IO;
+using System.Reflection;
+using System.Security.Principal;
 
 
 namespace ESPMonitor
@@ -19,10 +22,26 @@ namespace ESPMonitor
         private static Point _Location;
 
         private const string RunKey = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
-        private const string AppName = "ESP Monitor";
+        private const string AppName = "ESPMonitor";
         private static bool serialPortopened = false;
         private static bool showData = false;
         private static bool sendReset = false;
+
+        // Den Pfad des aktuellen Verzeichnisses des Programms ermitteln
+        private static string currentDirectory = AppDomain.CurrentDomain.BaseDirectory;
+
+        // Den Dateinamen des eigenen Programms ermitteln
+        private static string exeFileName = Path.GetFileName(Assembly.GetExecutingAssembly().Location);
+
+        // Den Namen der Batch-Datei festlegen (derselbe Name wie das Programm, aber mit .bat-Erweiterung)
+        private static string batchFileName = Path.ChangeExtension(exeFileName, ".bat");
+        private static string batchFilePath = Path.Combine(currentDirectory, batchFileName);
+
+        // Den Namen der Aufgabenplanung festlegen (Programmname ohne .exe)
+        string taskName = Path.GetFileNameWithoutExtension(exeFileName);
+
+        string currentUser = WindowsIdentity.GetCurrent().Name;
+        string adminGroupName = GetLocalizedGroupName(WellKnownSidType.BuiltinAdministratorsSid);
 
         // Statische Eigenschaft, um den Wert von numericUpDown1 zu speichern
         public static decimal NumericUpDownValue { get; set; }
@@ -94,14 +113,14 @@ namespace ESPMonitor
         {
             // Code zum Überprüfen, ob die Anwendung mit Windows gestartet wird
             // Rückgabewert true, wenn die Anwendung mit Windows gestartet wird, sonst false
-            return Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run").GetValue("ESP Monitor") != null;
+            return Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run").GetValue("ESPMonitor") != null;
         }
 
         private void InitializeSystray()
         {
             notifyIcon = new NotifyIcon();
             notifyIcon.Icon = Resources.car_esp_icon_138809;// Setzen Sie das Symbol für das Systray
-            notifyIcon.Text = "ESP Monitor"; // Text für das Systray-Symbol
+            notifyIcon.Text = "ESPMonitor"; // Text für das Systray-Symbol
             notifyIcon.Visible = true;
 
             // Ereignishandler für Doppelklick auf das Systray-Symbol
@@ -204,13 +223,23 @@ namespace ESPMonitor
 
             if (checkBox1.Checked)
             {
-                // Wenn die Checkbox aktiviert ist, fügen Sie einen Eintrag in der Registrierung hinzu
+                // Erstellen der Batch-Datei
+                // Erstellen der Aufgabenplanung
                 rkApp.SetValue(AppName, appPath);
+                CreateBatchFile(batchFilePath, currentDirectory, exeFileName);
+                CreateScheduledTask(taskName, batchFilePath, adminGroupName);
+                Console.WriteLine("Task Scheduler was succesfully created.");
+                this.AppendTextToTextBox("Task Scheduler was succesfully created.");
             }
             else
             {
-                // Wenn die Checkbox deaktiviert ist, entfernen Sie den Eintrag aus der Registrierung
+                // Löschen der Aufgabenplanung (auskommentieren, wenn nicht benötigt)
                 rkApp.DeleteValue(AppName, false);
+                // Löschen der Batch-Datei nur, wenn sie vorhanden ist
+                DeleteBatchFile(batchFilePath);
+                DeleteScheduledTask(taskName);
+                Console.WriteLine("Task Scheduler was succesfully deleted.");
+                this.AppendTextToTextBox("Task Scheduler was succesfully deleted.");
             }
         }
 
@@ -345,7 +374,6 @@ namespace ESPMonitor
 
         private void StartDataTransmission(SerialPort serialPort)
         {
-            bool test = true;
             Thread thread = new Thread(() =>
             {
                 while (true)
@@ -358,15 +386,13 @@ namespace ESPMonitor
                             serialPort.Open();
                             serialPortopened = true;                            
                         }
-                        if (test)
+                        else
                         {
                             serialPort.Write(jsonData);
-                            test = false;
-                            AppendTextToTextBox(jsonData);
                         }
                         if (showData)
                         {
-                            //AppendTextToTextBox(jsonData);
+                            AppendTextToTextBox(jsonData);
                         }
                     }
                     catch (Exception ex)
@@ -464,6 +490,72 @@ namespace ESPMonitor
             else
             {
                 textBox1.AppendText(text + Environment.NewLine);
+            }
+        }
+
+        private void CreateBatchFile(string batchFilePath, string currentDirectory, string exeFileName)
+        {
+            if (!File.Exists(batchFilePath))
+            {
+                using (StreamWriter writer = new StreamWriter(batchFilePath))
+                {
+                    writer.WriteLine("@echo off");
+                    writer.WriteLine($"start \"\" \"{Path.Combine(currentDirectory, exeFileName)}\"");
+                }
+                Console.WriteLine($"Batch-File was created: {batchFilePath}");
+                this.AppendTextToTextBox($"Batch-File was created: {batchFilePath}");
+            }
+        }
+
+        private void DeleteBatchFile(string batchFilePath)
+        {
+            if (File.Exists(batchFilePath))
+            {
+                File.Delete(batchFilePath);
+                Console.WriteLine($"Batch-File was deleted: {batchFilePath}");
+                this.AppendTextToTextBox($"Batch-File was deleted: {batchFilePath}");
+            }
+        }
+
+        private void CreateScheduledTask(string taskName, string batchFilePath, string userAccount)
+        {
+            string quotedBatchFilePath = $"\"{batchFilePath}\"";
+            string taskCommand = $"/create /tn \"{taskName}\" /tr {quotedBatchFilePath} /sc onlogon /ru \"{userAccount}\" /rl highest /f";
+            ExecuteCommand("schtasks.exe", taskCommand);
+        }
+
+        private void DeleteScheduledTask(string taskName)
+        {
+            string taskCommand = $"/delete /tn \"{taskName}\" /f";
+            ExecuteCommand("schtasks.exe", taskCommand);
+        }
+
+        private void ExecuteCommand(string fileName, string arguments)
+        {
+            Process process = new Process();
+            process.StartInfo.FileName = fileName;
+            process.StartInfo.Arguments = arguments;
+            process.StartInfo.RedirectStandardOutput = true;
+            process.StartInfo.UseShellExecute = false;
+            process.StartInfo.CreateNoWindow = true;
+            process.Start();
+            string result = process.StandardOutput.ReadToEnd();
+            process.WaitForExit();
+            Console.WriteLine(result);
+            this.AppendTextToTextBox($"Task Scheduler >> {result}");
+        }
+
+        static string GetLocalizedGroupName(WellKnownSidType sidType)
+        {
+            SecurityIdentifier sid = new SecurityIdentifier(sidType, null);
+            try
+            {
+                NTAccount ntAccount = (NTAccount)sid.Translate(typeof(NTAccount));
+                return ntAccount.ToString();
+            }
+            catch (Exception ex)
+            {
+                throw new Exception($"Error retrieving the group name: {ex.Message}");
             }
         }
     }
